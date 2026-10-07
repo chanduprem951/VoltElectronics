@@ -1,0 +1,186 @@
+name: volt-electronics-$(Date:yyyyMMdd).$(Rev:r)
+parameters:
+- name: deployAzure
+  displayName: Deploy to Azure (requires configured service connection and backend)
+  type: boolean
+  default: false
+
+trigger:
+  batch: true
+  branches:
+    include: [main, 'feature/*', 'codex/*']
+# Azure Repos pull requests use a main-branch build-validation policy.
+pool:
+  vmImage: ubuntu-latest
+variables:
+  pythonVersion: '3.12'
+  terraformVersion: '1.9.8'
+# Configure azureServiceConnection, subscriptionId, appName, azureLocation,
+# stateResourceGroup and stateStorageAccount in the pipeline UI.
+stages:
+- stage: Validate
+  displayName: Validate source and Terraform
+  jobs:
+  - job: Source
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+    - bash: |
+        set -euo pipefail
+        python -m compileall -q app.py catalog.py scripts tests
+        node --check static/app.js
+      displayName: Check source syntax
+  - job: Terraform
+    steps:
+    - template: pipelines/templates/install-terraform.yml
+    - bash: |
+        set -euo pipefail
+        terraform fmt -check -recursive infra
+        terraform -chdir=infra init -backend=false -lockfile=readonly -input=false
+        terraform -chdir=infra validate
+        terraform -chdir=infra/bootstrap init -backend=false -lockfile=readonly -input=false
+        terraform -chdir=infra/bootstrap validate
+      displayName: Validate both Terraform configurations
+      env:
+        TF_IN_AUTOMATION: 'true'
+- stage: Test
+  displayName: Test ecommerce behavior
+  dependsOn: Validate
+  jobs:
+  - job: ApplicationTests
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+    - bash: |
+        set -euo pipefail
+        python -m pip install -r requirements-dev.txt
+        mkdir -p reports
+        python -m pytest tests -v --junitxml=reports/tests.xml --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term-missing
+      displayName: Test authentication, checkout and inventory
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: reports/tests.xml
+        failTaskOnFailedTests: true
+        failTaskOnMissingResultsFile: true
+        testRunTitle: VoltElectronics ecommerce tests
+    - task: PublishCodeCoverageResults@2
+      condition: succeededOrFailed()
+      inputs:
+        summaryFileLocation: $(System.DefaultWorkingDirectory)/reports/coverage.xml
+        pathToSources: $(System.DefaultWorkingDirectory)
+        failIfCoverageEmpty: true
+- stage: Build
+  displayName: Build versioned application package
+  dependsOn: Test
+  jobs:
+  - job: Package
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+    - bash: |
+        set -euo pipefail
+        python scripts/package.py "$ARTIFACT_DIRECTORY" --commit "$COMMIT" --build "$BUILD_ID"
+      displayName: Package app, build metadata and SHA256 checksum
+      env:
+        ARTIFACT_DIRECTORY: $(Build.ArtifactStagingDirectory)/application
+        COMMIT: $(Build.SourceVersion)
+        BUILD_ID: $(Build.BuildId)
+    - publish: $(Build.ArtifactStagingDirectory)/application
+      artifact: application
+- ${{ if eq(parameters.deployAzure, true) }}:
+  - stage: Infrastructure
+    displayName: Plan and apply Azure infrastructure
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    lockBehavior: sequential
+    jobs:
+    - deployment: TerraformApply
+      environment: volt-electronics-production
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - template: pipelines/templates/install-terraform.yml
+            - task: AzureCLI@2
+              displayName: Initialize remote state, save plan and apply
+              inputs:
+                azureSubscription: $(azureServiceConnection)
+                addSpnToEnvironment: true
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+                  source scripts/terraform-auth.sh
+                  terraform -chdir=infra init -input=false -lockfile=readonly \
+                    -backend-config="resource_group_name=$STATE_RESOURCE_GROUP" \
+                    -backend-config="storage_account_name=$STATE_STORAGE_ACCOUNT" \
+                    -backend-config="container_name=tfstate" \
+                    -backend-config="key=volt-electronics/app.tfstate"
+                  terraform -chdir=infra plan -input=false -lock-timeout=5m -out=deployment.tfplan
+                  terraform -chdir=infra apply -input=false -lock-timeout=5m deployment.tfplan
+                  terraform -chdir=infra output -raw url
+              env:
+                SUBSCRIPTION_ID: $(subscriptionId)
+                APP_NAME: $(appName)
+                AZURE_LOCATION: $(azureLocation)
+                STATE_RESOURCE_GROUP: $(stateResourceGroup)
+                STATE_STORAGE_ACCOUNT: $(stateStorageAccount)
+                TF_IN_AUTOMATION: 'true'
+  - stage: Release
+    displayName: Deploy tested application artifact
+    dependsOn: Infrastructure
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    lockBehavior: sequential
+    jobs:
+    - deployment: WebApp
+      environment: volt-electronics-production
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: none
+            - download: current
+              artifact: application
+            - task: AzureCLI@2
+              displayName: Verify checksum and deploy ZIP
+              inputs:
+                azureSubscription: $(azureServiceConnection)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+                  cd "$ARTIFACT_DIRECTORY"
+                  sha256sum -c app.zip.sha256
+                  az webapp deploy --resource-group "${APP_NAME}-rg" --name "$APP_NAME" --src-path app.zip --type zip
+              env:
+                APP_NAME: $(appName)
+                ARTIFACT_DIRECTORY: $(Pipeline.Workspace)/application
+  - stage: Verify
+    displayName: Verify deployed store
+    dependsOn: Release
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+    - job: SmokeTest
+      steps:
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: $(pythonVersion)
+      - task: AzureCLI@2
+        displayName: Check health, catalog, assets and deployed commit
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            hostname=$(az webapp show --resource-group "${APP_NAME}-rg" --name "$APP_NAME" --query defaultHostName -o tsv)
+            python scripts/smoke.py "https://$hostname" --commit "$EXPECTED_COMMIT"
+        env:
+          APP_NAME: $(appName)
+          EXPECTED_COMMIT: $(Build.SourceVersion)
